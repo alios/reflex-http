@@ -33,66 +33,56 @@ import Data.ByteString.Lazy (ByteString)
 import Data.Either
 
 type MonadReflexHTTP a =
-  WriterT [Either ImportEvent (ExportReflex Spider)] SpiderHost a
+  WriterT [Binding Spider] SpiderHost a
 
-data ExportReflex t where
-  ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> ExportReflex t
-  ExportDynamic  :: (Aeson.ToJSON a) => [Text] -> Dynamic t a -> ExportReflex t
-  ExportEvent    :: (Aeson.ToJSON a) => [Text] -> Event t a -> ExportReflex t
-
-
-data ImportEvent where
-  ImportEvent :: [Text] -> (ByteString -> IO ImportEventFireResult) -> ImportEvent
+data Binding t where
+  ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> Binding t
+  ExportDynamic  :: (Aeson.ToJSON a) => [Text] -> Dynamic t a -> Binding t
+  ExportEvent    :: (Aeson.ToJSON a) => [Text] -> Event t a -> Binding t
+  ImportEvent    :: [Text] -> (ByteString -> IO ImportEventFireResult) -> Binding t
 
 data ImportEventFireResult =
   EventFired | EventNotSubscribed | EventParseError
 
 
 exportDynamic :: Aeson.ToJSON a => [Text] -> Dynamic Spider a -> MonadReflexHTTP ()
-exportDynamic ts d = tell [Right $ exportDynamic' ts d]
+exportDynamic ts d = tell [exportDynamic' ts d]
 
 exportBehavior :: Aeson.ToJSON a => [Text] -> Behavior Spider a -> MonadReflexHTTP ()
-exportBehavior ts d = tell [Right $ exportBehavior' ts d]
+exportBehavior ts d = tell [exportBehavior' ts d]
 
 exportEvent :: Aeson.ToJSON a => [Text] -> Event Spider a -> MonadReflexHTTP ()
-exportEvent ts d = tell [Right $ exportEvent' ts d]
+exportEvent ts d = tell [exportEvent' ts d]
 
 importEvent ::
   Aeson.FromJSON a => [Text] -> MonadReflexHTTP (Event Spider a)
 importEvent n = do
   (ie, e) <- lift $ importEvent' n
-  tell [Left ie]
+  tell [ie]
   return e
-
 
 runMonadReflexHTTP :: Port -> MonadReflexHTTP () -> IO ()
 runMonadReflexHTTP p m = do
-  w <- runSpiderHost . execWriterT $ m
-  let (is, es) = partitionEithers w
-  run p . logStdoutDev . gzip def $ mkApp is es
-
+  bs <- runSpiderHost . execWriterT $ m
+  run p . logStdoutDev . gzip def $ mkApp bs
 
 exportDynamic' ::
-  (Aeson.ToJSON a, Reflex t) => [Text] -> Dynamic t a -> ExportReflex t
+  (Aeson.ToJSON a, Reflex t) => [Text] -> Dynamic t a -> Binding t
 exportDynamic' = ExportDynamic
 
 exportBehavior' ::
-  (Aeson.ToJSON a, Reflex t) => [Text] -> Behavior t a -> ExportReflex t
+  (Aeson.ToJSON a, Reflex t) => [Text] -> Behavior t a -> Binding t
 exportBehavior' = ExportBehavior
 
 exportEvent' ::
-  (Aeson.ToJSON a, Reflex t) => [Text] -> Event t a -> ExportReflex t
+  (Aeson.ToJSON a, Reflex t) => [Text] -> Event t a -> Binding t
 exportEvent' = ExportEvent
 
-
-
 importEvent' ::
-  Aeson.FromJSON a => [Text] -> SpiderHost (ImportEvent, Event Spider a)
+  Aeson.FromJSON a => [Text] -> SpiderHost (Binding t, Event Spider a)
 importEvent' n = do
   (inputEvent, inputTriggerRef) <- newEventWithTriggerRef
   return (ImportEvent n $ fireEvent inputTriggerRef, inputEvent)
-
-
 
 main :: IO ()
 main = runMonadReflexHTTP 8080 $ do
@@ -103,10 +93,9 @@ main = runMonadReflexHTTP 8080 $ do
   
 
 
-mkApp :: [ImportEvent] -> [ExportReflex Spider] -> Application
-mkApp is bs rq resp =
-  let exportBehaviors = mkExportBehaviors bs
-      importEvents = mkImportEvents is
+mkApp :: [Binding Spider] -> Application
+mkApp bs rq resp =
+  let (exportBehaviors, importEvents, _) = mkBindings bs
       method = requestMethod rq
       app 
         | (method == methodGet) =
@@ -132,11 +121,32 @@ mkApp is bs rq resp =
       in app
 
 
-mkImportEvents :: [ImportEvent] -> Map [Text] (ByteString -> IO ImportEventFireResult)
-mkImportEvents = Map.fromList . fmap (\(ImportEvent n f) -> (n, f))
+mkBindings ::
+  [Binding Spider]
+  -> ( Map [Text] (Behavior Spider Response)
+     , Map [Text] (ByteString -> IO ImportEventFireResult)
+     , Map [Text] ()
+     )
+mkBindings i =
+  let (bs, is, es) = mkBindings_ ([],[],[]) i 
+  in (Map.fromList bs, Map.fromList is, Map.fromList es)
+  where
+    mkBindings_ i [] = i
+    mkBindings_ (bs, is, es) (ExportEvent n _ : xs) =
+      mkBindings_ (bs, is, (n, ()) : es) xs
+    mkBindings_ i (ExportDynamic ps d : xs) = mkBindings_ i $
+      ExportBehavior ps (current d) : ExportEvent ps (updated d) : xs
+    mkBindings_ (bs, is, es) (ExportBehavior n b : xs) =
+      let hdrs = [(hContentType, "application/json; charset=utf-8")]
+          toResponse =
+            responseBuilder ok200 hdrs . Aeson.fromEncoding . Aeson.toEncoding
+      in mkBindings_ ((n, toResponse <$> b) : bs, is, es) xs
+              
 
 
-mkExportBehaviors :: [ExportReflex Spider] -> Map [Text] (Behavior Spider Response)
+
+{-     
+mkExportBehaviors :: [Binding Spider] -> Map [Text] (Behavior Spider Response)
 mkExportBehaviors [] = mempty
 mkExportBehaviors (ExportEvent _ _ : xs) = mkExportBehaviors xs
 mkExportBehaviors (ExportDynamic ps d : xs) = mkExportBehaviors $
@@ -147,7 +157,7 @@ mkExportBehaviors (ExportBehavior ps b : xs) =
           [(hContentType, "application/json; charset=utf-8")]
         toResponse =
           responseBuilder ok200 hdrs . Aeson.fromEncoding . Aeson.toEncoding
-
+-}
 
   
   
