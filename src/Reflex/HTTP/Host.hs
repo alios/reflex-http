@@ -52,6 +52,9 @@ import Network.Wai.Middleware.Gzip
 import Network.Wai.Middleware.RequestLogger
 import Network.WebSockets (ServerApp)
 import Network.WebSockets.Connection
+import Control.Concurrent.STM
+import Control.Concurrent.STM.TChan
+import Data.Maybe (catMaybes)
 
 -- | The 'Monad' for construction of a 'Reflex' based 'Application'.
 --   Use 'runReflexHttpHost' execute it.
@@ -149,13 +152,19 @@ importEvent n = do
 -- This call will block for ever.
 runReflexHttpHost :: HostConfig -> ReflexHttpHost () -> IO ()
 runReflexHttpHost cfg m =
-  let st = HostState mempty mempty mempty
-  in do  
+  let mkState = HostState mempty mempty mempty
+  in do
+    chan <- liftIO newBroadcastTChanIO
+    hdlsRef <- liftIO . newTVarIO $ mempty
+    let st = mkState chan hdlsRef
+    
     bs <- snd <$> runSpiderHost (execRWST (runHost m) cfg st)
     let (b, i, e) = mkBindings bs
         appHttp = mkApp b i 
         wsApp = mkWsApp e
         app = websocketsOr (hostWsConnectionOptions cfg) wsApp appHttp
+
+    atomically . writeTVar hdlsRef $ Map.elems e
     run (hostPort cfg) . hostMiddleware cfg  $ app
 
 
@@ -195,29 +204,44 @@ data Binding t where
 data HostState = HostState {
   hostStateBehaviorExports :: Set [Text],
   hostStateEventImports :: Set [Text],
-  hostStateEventExports :: Set [Text]                           
+  hostStateEventExports :: Set [Text],
+  hostStateEventChan :: TChan WsEventMessage,
+  hostStateEventHandles :: TVar [EventHandle Spider WsEventMessage]
   }
 
 importEvent' ::
   Aeson.FromJSON a => [Text] -> ReflexHttpHost (Binding Spider, Event Spider a)
 importEvent' n = do
+  chan <- hostStateEventChan <$> get
+  hdls <- hostStateEventHandles <$> get
   (inputEvent, inputTriggerRef) <- liftIO . runSpiderHost $ newEventWithTriggerRef
-  return (ImportEvent n $ fireEvent inputTriggerRef, inputEvent)
+  return (ImportEvent n $ fireEvent inputTriggerRef hdls chan, inputEvent)
 
 fireEvent ::
-  (Aeson.FromJSON a) =>
-  IORef (Maybe (EventTrigger Spider a)) -> ByteString -> IO EventFireResult
-fireEvent ref e = liftIO $ handleTrigger ref
-  where handleTrigger trigger = runSpiderHost $ do
-          mETrigger <- liftIO $ readIORef trigger
-          case mETrigger of
-            Nothing -> return EventNotSubscribed
-            Just eTrigger ->
-              case Aeson.decode e of
-                Nothing -> return EventParseError
-                Just e' -> do
-                  fireEvents [ eTrigger :=> Identity e' ]
-                  return EventFired
+  (Aeson.FromJSON a)
+  => IORef (Maybe (EventTrigger Spider a))
+  -> TVar [EventHandle Spider WsEventMessage]
+  -> TChan WsEventMessage
+  -> ByteString
+  -> IO EventFireResult
+fireEvent ref hdlsRef chan e = liftIO $ handleTrigger ref
+  where
+    handleTrigger trigger = runSpiderHost $ do
+      mETrigger <- liftIO $ readIORef trigger
+      hdls <- liftIO . readTVarIO $ hdlsRef
+      case mETrigger of
+        Nothing -> return EventNotSubscribed
+        Just eTrigger ->
+          case Aeson.decode e of
+            Nothing -> return EventParseError
+            Just e' -> do
+              ms <- fireEventsAndRead [ eTrigger :=> Identity e' ] $ readPhase hdls
+              liftIO . atomically . sequence $
+                [ writeTChan chan m | m <- ms ]
+              return EventFired
+    readPhase hdls = do
+      es <- fmap catMaybes . sequence $ readEvent <$> hdls
+      sequence es
             
 
 mkWsApp :: Map [Text] (EventHandle Spider WsEventMessage) -> ServerApp
