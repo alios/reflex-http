@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GADTs #-}
@@ -12,7 +13,10 @@
 -- License     :  BSD-style (see the file LICENSE)
 -- Maintainer  :  Markus Barenhoff <mbarenh@alios.org>
 -- Stability   :  provisional
--- Portability :  OverloadedStrings, GADTs, GeneralizedNewtypeDeriving
+-- Portability :  OverloadedStrings,
+--                GADTs,
+--                GeneralizedNewtypeDeriving,
+--                DeriveGeneric
 --
 -- Run a HTTP host based on 'Reflex' FRP.
 --
@@ -50,11 +54,14 @@ import Network.Wai.Handler.Warp
 import Network.Wai.Handler.WebSockets
 import Network.Wai.Middleware.Gzip
 import Network.Wai.Middleware.RequestLogger
-import Network.WebSockets (ServerApp)
+import Network.WebSockets (ServerApp, DataMessage(..))
 import Network.WebSockets.Connection
 import Control.Concurrent.STM
 import Control.Concurrent.STM.TChan
 import Data.Maybe (catMaybes)
+import Control.Concurrent.Async
+import Data.Typeable (Typeable)
+import GHC.Generics (Generic)
 
 -- | The 'Monad' for construction of a 'Reflex' based 'Application'.
 --   Use 'runReflexHttpHost' execute it.
@@ -66,13 +73,23 @@ newtype ReflexHttpHost a = ReflexHttpHost {
              , MonadState HostState) 
 
 
--- | The data Type that is sent from host to client over websocket
+-- | The message that is sent from host to client over websocket
 --   in case of an exported 'Event' fireing.
 data WsEventMessage =
   WsEventMessage {
     eventName :: [Text],
     eventValue :: Aeson.Value
-    }
+    } deriving (Eq, Show, Typeable, Generic)
+
+-- | The message that is sent from client to host over websocket
+--   to subscribe 'Event' fireings.
+newtype WsSubscribeMessage = WsSubscribeMessage [[Text]]
+  deriving (Eq, Show, Typeable, Generic)
+
+instance Aeson.ToJSON WsEventMessage
+instance Aeson.FromJSON WsEventMessage 
+instance Aeson.ToJSON WsSubscribeMessage
+instance Aeson.FromJSON WsSubscribeMessage
   
 
 -- | Register a 'Behavior' with the 'Application'.
@@ -161,7 +178,7 @@ runReflexHttpHost cfg m =
     bs <- snd <$> runSpiderHost (execRWST (runHost m) cfg st)
     let (b, i, e) = mkBindings bs
         appHttp = mkApp b i 
-        wsApp = mkWsApp e
+        wsApp = mkWsApp (hostWsPingTime cfg) chan
         app = websocketsOr (hostWsConnectionOptions cfg) wsApp appHttp
 
     atomically . writeTVar hdlsRef $ Map.elems e
@@ -175,7 +192,9 @@ data HostConfig = HostConfig {
   -- | the 'Middleware' components to be used by the HTTP server.
   hostMiddleware :: Middleware,
   -- | the 'SeverApp' Websocket 'ConnectionOptions'
-  hostWsConnectionOptions :: ConnectionOptions
+  hostWsConnectionOptions :: ConnectionOptions,
+  -- | the keep alive ping time for websocket connections
+  hostWsPingTime :: Int
   }
 
 
@@ -184,7 +203,7 @@ data HostConfig = HostConfig {
 --   Uses 'gzip' compression and and 'logStdoutDev' logger.
 defaultHostConfig :: HostConfig
 defaultHostConfig =
-  HostConfig 8080 (logStdoutDev . gzip def) defaultConnectionOptions
+  HostConfig 8080 (logStdoutDev . gzip def) defaultConnectionOptions 5
 
 
 --
@@ -244,8 +263,27 @@ fireEvent ref hdlsRef chan e = liftIO $ handleTrigger ref
       sequence es
             
 
-mkWsApp :: Map [Text] (EventHandle Spider WsEventMessage) -> ServerApp
-mkWsApp es = undefined
+mkWsApp :: Int -> TChan WsEventMessage -> ServerApp
+mkWsApp pingT chan' pend_conn = do
+  conn <- acceptRequest pend_conn
+  forkPingThread conn pingT
+  
+  chan <- atomically $ dupTChan chan'
+  subs <- newTVarIO (mempty :: Set [Text])
+  
+  void $ race (receiver subs conn) (sender chan conn)
+    where receiver subs conn = forever $ do
+            msg <- receiveDataMessage conn
+            let psM = case msg of
+                  Text t -> Nothing
+                  Binary bs -> Aeson.decode bs
+            case psM of
+              Nothing -> return ()
+              Just (WsSubscribeMessage ps) ->
+                atomically . modifyTVar subs $ mappend (Set.fromList ps)
+          sender chan conn = forever $ do
+            atomically (readTChan chan) >>=  sendBinaryData conn . Aeson.encode
+            return ()
 
 mkApp :: Map [Text] (Behavior Spider Response)
       -> Map [Text] (ByteString -> IO EventFireResult)
