@@ -136,30 +136,14 @@ mkBindings i =
       mkBindings_ (bs, is, (n, ()) : es) xs
     mkBindings_ i (ExportDynamic ps d : xs) = mkBindings_ i $
       ExportBehavior ps (current d) : ExportEvent ps (updated d) : xs
+    mkBindings_ (bs, is, es) (ImportEvent n f : xs) =
+      mkBindings_ (bs, (n, f) : is, es) xs            
     mkBindings_ (bs, is, es) (ExportBehavior n b : xs) =
       let hdrs = [(hContentType, "application/json; charset=utf-8")]
           toResponse =
             responseBuilder ok200 hdrs . Aeson.fromEncoding . Aeson.toEncoding
       in mkBindings_ ((n, toResponse <$> b) : bs, is, es) xs
               
-
-
-
-{-     
-mkExportBehaviors :: [Binding Spider] -> Map [Text] (Behavior Spider Response)
-mkExportBehaviors [] = mempty
-mkExportBehaviors (ExportEvent _ _ : xs) = mkExportBehaviors xs
-mkExportBehaviors (ExportDynamic ps d : xs) = mkExportBehaviors $
-    ExportBehavior ps (current d) : ExportEvent ps (updated d) : xs
-mkExportBehaviors (ExportBehavior ps b : xs) =
-  Map.insert ps (toResponse <$> b) $ mkExportBehaviors xs
-  where hdrs =
-          [(hContentType, "application/json; charset=utf-8")]
-        toResponse =
-          responseBuilder ok200 hdrs . Aeson.fromEncoding . Aeson.toEncoding
--}
-
-  
   
 fireEvent ::
   (Aeson.FromJSON a) =>
