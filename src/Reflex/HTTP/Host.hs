@@ -62,6 +62,16 @@ newtype ReflexHttpHost a = ReflexHttpHost {
              , MonadReader HostConfig, MonadWriter [Binding Spider]
              , MonadState HostState) 
 
+
+-- | The data Type that is sent from host to client over websocket
+--   in case of an exported 'Event' fireing.
+data WsEventMessage =
+  WsEventMessage {
+    eventName :: [Text],
+    eventValue :: Aeson.Value
+    }
+  
+
 -- | Register a 'Behavior' with the 'Application'.
 -- A JSON representation will be availible as /GET/ under the given url path.
 -- Will 'fail' if trying to register with same path more then once.
@@ -114,7 +124,7 @@ exportEvent n e = do
     then fail . mconcat $
          [ "exportEvent: export with ", show n, " already exists." ]
     else do
-    eh <- subscribeEvent $ Aeson.encode <$> e
+    eh <- subscribeEvent $ (WsEventMessage n . Aeson.toJSON) <$> e
     tell [ExportEvent n eh]
     modify (\st -> st { hostStateEventExports = Set.insert n es })
 
@@ -179,7 +189,7 @@ data EventFireResult =
   
 data Binding t where
   ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> Binding t
-  ExportEvent :: [Text] -> EventHandle t ByteString -> Binding t
+  ExportEvent :: [Text] -> EventHandle t WsEventMessage -> Binding t
   ImportEvent :: [Text] -> (ByteString -> IO EventFireResult) -> Binding t
 
 data HostState = HostState {
@@ -210,7 +220,7 @@ fireEvent ref e = liftIO $ handleTrigger ref
                   return EventFired
             
 
-mkWsApp :: Map [Text] (EventHandle Spider ByteString) -> ServerApp
+mkWsApp :: Map [Text] (EventHandle Spider WsEventMessage) -> ServerApp
 mkWsApp es = undefined
 
 mkApp :: Map [Text] (Behavior Spider Response)
@@ -245,7 +255,7 @@ mkBindings ::
   [Binding Spider]
   -> ( Map [Text] (Behavior Spider Response)
      , Map [Text] (ByteString -> IO EventFireResult)
-     , Map [Text] (EventHandle Spider ByteString)
+     , Map [Text] (EventHandle Spider WsEventMessage)
      )
 mkBindings i =
   let (bs, is, es) = mkBindings_ ([],[],[]) i 
