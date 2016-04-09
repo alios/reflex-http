@@ -26,7 +26,7 @@ module Reflex.HTTP.Host
          -- * Run Host
        , runReflexHttpHost
          -- ** Host Config
-       , HostConfig (..), defaultHostConfig, hostPort, hostMiddleware
+       , HostConfig (..), defaultHostConfig
        ) where
 
 import Reflex
@@ -46,9 +46,11 @@ import Data.Dependent.Map (DSum (..))
 import Network.HTTP.Types
 import Network.Wai
 import Network.Wai.Handler.Warp
+import Network.Wai.Handler.WebSockets
 import Network.Wai.Middleware.Gzip
 import Network.Wai.Middleware.RequestLogger
-
+import Network.WebSockets (ServerApp)
+import Network.WebSockets.Connection
 
 -- | The 'Monad' for construction of a 'Reflex' based 'Application'.
 --   Use 'runReflexHttpHost' execute it.
@@ -140,7 +142,11 @@ runReflexHttpHost cfg m =
   let st = HostState mempty mempty mempty
   in do  
     bs <- snd <$> runSpiderHost (execRWST (runHost m) cfg st)
-    run (hostPort cfg) . hostMiddleware cfg  $ mkApp bs
+    let (b, i, e) = mkBindings bs
+        appHttp = mkApp b i 
+        wsApp = mkWsApp e
+        app = websocketsOr (hostWsConnectionOptions cfg) wsApp appHttp
+    run (hostPort cfg) . hostMiddleware cfg  $ app
 
 
 -- | Configuration to be used with 'runReflexHttpHost'.
@@ -148,7 +154,9 @@ data HostConfig = HostConfig {
   -- | the listening 'Port' used by the HTTP server.
   hostPort :: Port,
   -- | the 'Middleware' components to be used by the HTTP server.
-  hostMiddleware :: Middleware
+  hostMiddleware :: Middleware,
+  -- | the 'SeverApp' Websocket 'ConnectionOptions'
+  hostWsConnectionOptions :: ConnectionOptions
   }
 
 
@@ -157,7 +165,7 @@ data HostConfig = HostConfig {
 --   Uses 'gzip' compression and and 'logStdoutDev' logger.
 defaultHostConfig :: HostConfig
 defaultHostConfig =
-  HostConfig 8080 $ logStdoutDev . gzip def
+  HostConfig 8080 (logStdoutDev . gzip def) defaultConnectionOptions
 
 
 --
@@ -203,10 +211,14 @@ fireEvent ref e = liftIO . runSpiderHost $ handleTrigger ref
                   return EventFired
             
 
-mkApp :: [Binding Spider] -> Application
-mkApp bs rq resp =
-  let (exportBehaviors, importEvents, _) = mkBindings bs
-      method = requestMethod rq
+mkWsApp :: Map [Text] () -> ServerApp
+mkWsApp es = undefined
+
+mkApp :: Map [Text] (Behavior Spider Response)
+      -> Map [Text] (ByteString -> IO EventFireResult)
+      -> Application
+mkApp exportBehaviors importEvents rq resp =
+  let method = requestMethod rq
       app 
         | (method == methodGet) =
             case Map.lookup (pathInfo rq) exportBehaviors of
