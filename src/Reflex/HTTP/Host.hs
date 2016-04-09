@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -113,7 +114,8 @@ exportEvent n e = do
     then fail . mconcat $
          [ "exportEvent: export with ", show n, " already exists." ]
     else do
-    tell [ExportEvent n e]
+    eh <- subscribeEvent $ Aeson.encode <$> e
+    tell [ExportEvent n eh]
     modify (\st -> st { hostStateEventExports = Set.insert n es })
 
 -- | Import an 'Event' from the 'Application'.
@@ -177,7 +179,7 @@ data EventFireResult =
   
 data Binding t where
   ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> Binding t
-  ExportEvent :: (Aeson.ToJSON a) => [Text] -> Event t a -> Binding t
+  ExportEvent :: [Text] -> EventHandle t ByteString -> Binding t
   ImportEvent :: [Text] -> (ByteString -> IO EventFireResult) -> Binding t
 
 data HostState = HostState {
@@ -208,7 +210,7 @@ fireEvent ref e = liftIO $ handleTrigger ref
                   return EventFired
             
 
-mkWsApp :: Map [Text] () -> ServerApp
+mkWsApp :: Map [Text] (EventHandle Spider ByteString) -> ServerApp
 mkWsApp es = undefined
 
 mkApp :: Map [Text] (Behavior Spider Response)
@@ -243,15 +245,15 @@ mkBindings ::
   [Binding Spider]
   -> ( Map [Text] (Behavior Spider Response)
      , Map [Text] (ByteString -> IO EventFireResult)
-     , Map [Text] ()
+     , Map [Text] (EventHandle Spider ByteString)
      )
 mkBindings i =
   let (bs, is, es) = mkBindings_ ([],[],[]) i 
   in (Map.fromList bs, Map.fromList is, Map.fromList es)
   where
     mkBindings_ i [] = i
-    mkBindings_ (bs, is, es) (ExportEvent n _ : xs) =
-      mkBindings_ (bs, is, (n, ()) : es) xs
+    mkBindings_ (bs, is, es) (ExportEvent n bsh : xs) =
+      mkBindings_ (bs, is, (n, bsh) : es) xs
     mkBindings_ (bs, is, es) (ImportEvent n f : xs) =
       mkBindings_ (bs, (n, f) : is, es) xs            
     mkBindings_ (bs, is, es) (ExportBehavior n b : xs) =
