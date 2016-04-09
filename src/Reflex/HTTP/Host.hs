@@ -97,10 +97,8 @@ exportDynamic n d = do
                             [ "exportDynamic: export event with ", show n
                             , " already exists." ]
       else do
-      tell [ExportDynamic n d]
-      modify (\st -> st {
-                 hostStateBehaviorExports = Set.insert n bs,
-                 hostStateEventExports = Set.insert n es })
+        exportEvent n (updated d)
+        exportBehavior n (current d)
 
 -- | Register an 'Event' with the 'Application'
 -- Fireings will be availible through websocket.
@@ -179,7 +177,6 @@ data EventFireResult =
   
 data Binding t where
   ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> Binding t
-  ExportDynamic  :: (Aeson.ToJSON a) => [Text] -> Dynamic t a -> Binding t
   ExportEvent :: (Aeson.ToJSON a) => [Text] -> Event t a -> Binding t
   ImportEvent :: [Text] -> (ByteString -> IO EventFireResult) -> Binding t
 
@@ -198,8 +195,8 @@ importEvent' n = do
 fireEvent ::
   (Aeson.FromJSON a) =>
   IORef (Maybe (EventTrigger Spider a)) -> ByteString -> IO EventFireResult
-fireEvent ref e = liftIO . runSpiderHost $ handleTrigger ref
-  where handleTrigger trigger = do
+fireEvent ref e = liftIO $ handleTrigger ref
+  where handleTrigger trigger = runSpiderHost $ do
           mETrigger <- liftIO $ readIORef trigger
           case mETrigger of
             Nothing -> return EventNotSubscribed
@@ -255,8 +252,6 @@ mkBindings i =
     mkBindings_ i [] = i
     mkBindings_ (bs, is, es) (ExportEvent n _ : xs) =
       mkBindings_ (bs, is, (n, ()) : es) xs
-    mkBindings_ i (ExportDynamic ps d : xs) = mkBindings_ i $
-      ExportBehavior ps (current d) : ExportEvent ps (updated d) : xs
     mkBindings_ (bs, is, es) (ImportEvent n f : xs) =
       mkBindings_ (bs, (n, f) : is, es) xs            
     mkBindings_ (bs, is, es) (ExportBehavior n b : xs) =
