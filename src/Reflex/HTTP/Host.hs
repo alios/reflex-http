@@ -3,17 +3,30 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE Trustworthy #-}
 
+
+-------------------------------------------------------------------------------
+-- |
+-- Module      :  Reflex.HTTP.Host
+-- Copyright   :  (C) 2016 Markus Barenhoff
+-- License     :  BSD-style (see the file LICENSE)
+-- Maintainer  :  Markus Barenhoff <mbarenh@alios.org>
+-- Stability   :  provisional
+-- Portability :  OverloadedStrings, GADTs, GeneralizedNewtypeDeriving
+--
+-- Run a HTTP host based on 'Reflex' FRP.
+--
+-------------------------------------------------------------------------------
 module Reflex.HTTP.Host
        ( ReflexHttpHost
-         -- | * Import/Export from/to HTTP
+         -- * HTTP Import Export
        , importEvent
        , exportBehavior
        , exportDynamic
        , exportEvent
-         -- | * Run ReflexHttpHost
+         -- * Run Host
        , runReflexHttpHost
-         -- | ** Host Config
-       , HostConfig, defaultHostConfig, hostPort, hostMiddleware
+         -- ** Host Config
+       , HostConfig (..), defaultHostConfig, hostPort, hostMiddleware
        ) where
 
 import Reflex
@@ -36,34 +49,9 @@ import Network.Wai.Handler.Warp
 import Network.Wai.Middleware.Gzip
 import Network.Wai.Middleware.RequestLogger
 
-data EventFireResult =
-  EventFired | EventNotSubscribed | EventParseError
-  deriving (Eq)
-           
-data HostConfig = HostConfig {
-  hostPort :: Port,
-  hostMiddleware :: Middleware
-  }
 
-defaultHostConfig :: HostConfig
-defaultHostConfig =
-  HostConfig 8080 $ logStdoutDev . gzip def
-
-
-  
-data Binding t where
-  ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> Binding t
-  ExportDynamic  :: (Aeson.ToJSON a) => [Text] -> Dynamic t a -> Binding t
-  ExportEvent :: (Aeson.ToJSON a) => [Text] -> Event t a -> Binding t
-  ImportEvent :: [Text] -> (ByteString -> IO EventFireResult) -> Binding t
-
-data HostState = HostState {
-  hostStateBehaviorExports :: Set [Text],
-  hostStateEventImports :: Set [Text],
-  hostStateEventExports :: Set [Text]                           
-  }
-
-
+-- | The 'Monad' for construction of a 'Reflex' based 'Application'.
+--   Use 'runReflexHttpHost' execute it.
 newtype ReflexHttpHost a = ReflexHttpHost {
   runHost :: RWST HostConfig [Binding Spider] HostState SpiderHost a
   } deriving ( Functor, Applicative, Monad, MonadIO, MonadFix
@@ -71,8 +59,13 @@ newtype ReflexHttpHost a = ReflexHttpHost {
              , MonadReader HostConfig, MonadWriter [Binding Spider]
              , MonadState HostState) 
 
+-- | Register a 'Behavior' with the 'Application'.
+-- A JSON representation will be availible as /GET/ under the given url path.
+-- Will 'fail' if trying to register with same path more then once.
 exportBehavior ::
-  Aeson.ToJSON a => [Text] -> Behavior Spider a -> ReflexHttpHost ()  
+  Aeson.ToJSON a => [Text] -- ^ the HTTP path elements
+  -> Behavior Spider a -- ^ the 'Behavior' to be 'sample'd
+  -> ReflexHttpHost ()  
 exportBehavior n b = do
   bs <- hostStateBehaviorExports <$> get
   if Set.member n bs
@@ -82,9 +75,15 @@ exportBehavior n b = do
     tell [ExportBehavior n b]
     modify (\st -> st { hostStateBehaviorExports = Set.insert n bs })
 
-
+-- | Register a 'Dynamic' with the 'Application'.
+-- A JSON representation of its current value  will be availible as /GET/
+-- under the given url path.
+-- Its update 'Event' will be availible through websocket.
+-- Will 'fail' if trying to register with same path more then once.
 exportDynamic ::
-  Aeson.ToJSON a => [Text] -> Dynamic Spider a -> ReflexHttpHost ()  
+  Aeson.ToJSON a => [Text] -- ^ the HTTP path elements
+  -> Dynamic Spider a -- ^ the Dynamic which value will be used
+  -> ReflexHttpHost ()  
 exportDynamic n d = do
   bs <- hostStateBehaviorExports <$> get
   if Set.member n bs then fail . mconcat $
@@ -100,9 +99,14 @@ exportDynamic n d = do
       modify (\st -> st {
                  hostStateBehaviorExports = Set.insert n bs,
                  hostStateEventExports = Set.insert n es })
-    
+
+-- | Register an 'Event' with the 'Application'
+-- Fireings will be availible through websocket.
+-- Will 'fail' if trying to register with same path more then once.
 exportEvent ::
-  Aeson.ToJSON a => [Text] -> Event Spider a -> ReflexHttpHost ()  
+  Aeson.ToJSON a => [Text] -- ^ the name elements
+  -> Event Spider a -- ^ the 'Event' to export 
+  -> ReflexHttpHost ()  
 exportEvent n e = do
   es <- hostStateEventExports <$> get
   if Set.member n es
@@ -112,9 +116,12 @@ exportEvent n e = do
     tell [ExportEvent n e]
     modify (\st -> st { hostStateEventExports = Set.insert n es })
 
-
+-- | Import an 'Event' from the 'Application'.
+-- JSON encoded data as /POST/ will be accepted on the given
+-- path and will cause the returned 'Event' to fire.
 importEvent ::
-  Aeson.FromJSON a => [Text] -> ReflexHttpHost (Event Spider a)
+  Aeson.FromJSON a => [Text] -- ^ the HTTP path elements
+  -> ReflexHttpHost (Event Spider a)
 importEvent n = do
   is <- hostStateEventImports <$> get
   if Set.member n is
@@ -125,6 +132,54 @@ importEvent n = do
     tell [ ie ]
     modify (\st -> st { hostStateEventImports = Set.insert n is })
     return e
+
+-- | Run a 'ReflexHttpHost' and Start HTTP Server.
+-- This call will block for ever.
+runReflexHttpHost :: HostConfig -> ReflexHttpHost () -> IO ()
+runReflexHttpHost cfg m =
+  let st = HostState mempty mempty mempty
+  in do  
+    bs <- snd <$> runSpiderHost (execRWST (runHost m) cfg st)
+    run (hostPort cfg) . hostMiddleware cfg  $ mkApp bs
+
+
+-- | Configuration to be used with 'runReflexHttpHost'.
+data HostConfig = HostConfig {
+  -- | the listening 'Port' used by the HTTP server.
+  hostPort :: Port,
+  -- | the 'Middleware' components to be used by the HTTP server.
+  hostMiddleware :: Middleware
+  }
+
+
+-- | The default 'HostConfig' to be used with 'runReflexHttpHost'.
+--   Will make Server listen on port /8080/. 
+--   Uses 'gzip' compression and and 'logStdoutDev' logger.
+defaultHostConfig :: HostConfig
+defaultHostConfig =
+  HostConfig 8080 $ logStdoutDev . gzip def
+
+
+--
+-- Helpers
+--
+
+data EventFireResult =
+  EventFired | EventNotSubscribed | EventParseError
+  deriving (Eq)
+           
+  
+data Binding t where
+  ExportBehavior :: (Aeson.ToJSON a) => [Text] -> Behavior t a -> Binding t
+  ExportDynamic  :: (Aeson.ToJSON a) => [Text] -> Dynamic t a -> Binding t
+  ExportEvent :: (Aeson.ToJSON a) => [Text] -> Event t a -> Binding t
+  ImportEvent :: [Text] -> (ByteString -> IO EventFireResult) -> Binding t
+
+data HostState = HostState {
+  hostStateBehaviorExports :: Set [Text],
+  hostStateEventImports :: Set [Text],
+  hostStateEventExports :: Set [Text]                           
+  }
 
 importEvent' ::
   Aeson.FromJSON a => [Text] -> ReflexHttpHost (Binding Spider, Event Spider a)
@@ -147,12 +202,6 @@ fireEvent ref e = liftIO . runSpiderHost $ handleTrigger ref
                   fireEvents [ eTrigger :=> Identity e' ]
                   return EventFired
             
-runReflexHttpHost :: HostConfig -> ReflexHttpHost () -> IO ()
-runReflexHttpHost cfg m =
-  let st = HostState mempty mempty mempty
-  in do  
-    bs <- snd <$> runSpiderHost (execRWST (runHost m) cfg st)
-    run (hostPort cfg) . hostMiddleware cfg  $ mkApp bs
 
 mkApp :: [Binding Spider] -> Application
 mkApp bs rq resp =
